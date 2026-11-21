@@ -57,7 +57,7 @@ METHODS = ("GET", "POST", "DELETE", "STATE")
 PKT_MAGIC = 0x5C
 PKT_HEADER = 25                     # 图像报头长度（含 hidapi 的 report id）
 PKT_CHUNK = 1000                    # 每包携带的 JPEG 字节
-PKT_KIND_IMAGE = 0x21
+PKT_KIND_IMAGE = 0x20          # 厂商报文第 5 字节：帧号，每推一帧 +1（0x20, 0x21, ...）
 PKT_SEQ_START = 256                 # 每帧的起始包序号（厂商实测值）
 
 
@@ -152,7 +152,9 @@ def image_packets(jpeg: bytes, seq: int = PKT_SEQ_START, chunk: int = PKT_CHUNK,
                   kind: int = PKT_KIND_IMAGE) -> list[bytes]:
     """把一张 JPEG 切成厂商格式的报文列表。
 
-    ``seq`` 是帧内序号：每帧都从 256 重新开始、逐包 +1（见模块 docstring）。
+    ``kind`` 是帧号（第 5 字节）：厂商每推一帧 +1，0x20 → 0x21 → …，8 位回绕；
+    整帧所有包共用同一个帧号。``seq`` 才是帧内序号：每帧从 256 重新开始、逐包 +1。
+    抓包实锤：帧号不随包变，帧内序号随包变，两个字段别搞反。
     """
     if not jpeg:
         raise InvalidArgument("JPEG 为空")
@@ -185,6 +187,8 @@ class AigoXingcanlan(LcdComm):
         self._spec: dict[str, Any] = {}
         self._cmd_seq = 0
         self._frames = 0
+        self._frame_id = PKT_KIND_IMAGE
+        self._last_keepalive = 0.0
 
     # ── 探测 / 打开 ─────────────────────────────────────────────────────
     @classmethod
@@ -316,6 +320,19 @@ class AigoXingcanlan(LcdComm):
         if not (self._post_json("mode", {"value": int(value)}) or {}).get("status") == 200:
             raise DeviceOffline("切换模式没得到 200")
 
+    def power_resume(self) -> None:
+        """厂商日志里的 ``POST power {"event":"resume"}``：把整块屏从断电态叫醒。"""
+        if not (self._post_json("power", {"event": "resume"}) or {}).get("status") == 200:
+            raise DeviceOffline("power resume 没得到 200")
+
+    def heartbeat(self) -> None:
+        """``STATE all {"heartbeat":1}``：续一次超时计时，避免 60 秒后被断电。"""
+        body = json.dumps({"heartbeat": 1}).encode()
+        reply = self.request("STATE", "all",
+                             {"ContentType": "json", "ContentLength": len(body)}, body)
+        if not (reply or {}).get("status") == 200:
+            raise DeviceOffline("heartbeat 没得到 200")
+
     def start_realtime(self, enable: bool = True) -> None:
         if not (self._post_json("realtimeDisplay", {"enable": bool(enable)}) or {}).get("status") == 200:
             raise DeviceOffline("切换实时显示没得到 200")
@@ -332,24 +349,34 @@ class AigoXingcanlan(LcdComm):
         if rotation % 360:
             img = img.rotate(-rotation % 360, expand=False)
 
+        if img.mode != "RGB":
+            img = img.convert("RGB")
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG",
-                                quality=int(self.config.get("jpeg_quality") or 70), optimize=False)
-        packets = image_packets(buf.getvalue())
+        img.save(buf, format="JPEG",
+                 quality=int(self.config.get("jpeg_quality") or 70), optimize=False)
+        packets = image_packets(buf.getvalue(), kind=self._frame_id)
 
-        gap = float(self.config.get("packet_gap", 0.002))
+        gap = float(self.config.get("packet_gap", 0.001))
         for packet in packets:
             self._dev.write(packet)
             if gap > 0:
                 time.sleep(gap)
+        self._frame_id = (self._frame_id + 1) & 0xFF      # 帧号逐帧 +1，厂商行为
         self._frames += 1
 
     def push_region(self, frame: Frame, x: int, y: int) -> None:
         raise Unsupported("爱国者 星璨岚 目前只按整帧推")
 
     def _wake(self) -> None:
-        """把设备调到「能显示」的状态：亮度 → mode 2 → 实时通道，每步都要 200。"""
+        """按厂商的唤醒顺序把设备叫起来，每步都要 200。
+
+        抓官方软件日志的顺序是：conn → power resume → STATE all heartbeat →
+        realtimeDisplay。少了 ``power resume`` 时，设备在空闲后会整块断电（背光全灭），
+        此时再怎么推图都收不到——这就是「突然黑了」的来源。
+        """
         steps = (
+            ("power", lambda: self.power_resume()),
+            ("heartbeat", lambda: self.heartbeat()),
             ("brightness", lambda: self.set_brightness(int(self.config.get("brightness") or 100))),
             ("mode", lambda: self.set_mode(int(self.config.get("mode") if self.config.get("mode")
                                               is not None else 2))),
@@ -366,8 +393,15 @@ class AigoXingcanlan(LcdComm):
                 raise DeviceBusy(f"唤醒失败：{name} 三次都没成功，屏可能卡在休眠/错误状态")
 
     def tick(self, now: float) -> None:
-        """刻意留空：这台固件把 HID 当一条图像流，中途插入命令帧会让流断开、整屏黑。
-        需要唤醒时重新 open 设备即可（见 _wake）。"""
+        """长时间推流要定期补一次「我还在」，否则固件按 timeout 把整块屏断电。"""
+        every = float(self.config.get("keepalive_sec", 15))
+        if every <= 0 or now - self._last_keepalive < every:
+            return
+        self._last_keepalive = now
+        try:
+            self.power_resume()
+        except (DeviceOffline, DeviceBusy, InvalidArgument, OSError):
+            pass
 
     def status(self) -> dict[str, Any]:
         return {"driver": self.driver_id, "size": list(self._size), "frames": self._frames,
