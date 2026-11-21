@@ -320,6 +320,17 @@ class AigoXingcanlan(LcdComm):
         if not (self._post_json("mode", {"value": int(value)}) or {}).get("status") == 200:
             raise DeviceOffline("切换模式没得到 200")
 
+    def reset_panel(self, pause: float = 1.2) -> None:
+        """屏幕掉电/花屏后的复位：先 suspend 断一下再 resume，再做其余唤醒。
+
+        真机对比过：只发 resume/brightness/mode/realtime 时帧能写进去但屏上没反应；
+        先打一次 suspend → resume，同样的帧立刻出画面。这是「又黑了」的唯一解。
+        """
+        self._post_json("power", {"event": "suspend"})
+        time.sleep(pause)
+        if not (self._post_json("power", {"event": "resume"}) or {}).get("status") == 200:
+            raise DeviceOffline("复位失败：power resume 没得到 200")
+
     def power_resume(self) -> None:
         """厂商日志里的 ``POST power {"event":"resume"}``：把整块屏从断电态叫醒。"""
         if not (self._post_json("power", {"event": "resume"}) or {}).get("status") == 200:
@@ -375,6 +386,7 @@ class AigoXingcanlan(LcdComm):
         此时再怎么推图都收不到——这就是「突然黑了」的来源。
         """
         steps = (
+            ("reset-panel", lambda: self.reset_panel()),      # 关键：真机验证过，不先复位推上去不显示
             ("power", lambda: self.power_resume()),
             ("heartbeat", lambda: self.heartbeat()),
             ("brightness", lambda: self.set_brightness(int(self.config.get("brightness") or 100))),

@@ -83,7 +83,7 @@ def test_image_packets_layout():
     assert first[0] == 0x00
     assert first[1] == 0x5C
     assert int.from_bytes(first[2:4], "big") == len(first) - 4
-    assert first[4] == 0x21
+    assert first[4] == 0x20          # 帧号：默认从 0x20 起，由 push_frame 逐帧 +1
     assert first[6] == 3                            # blockCount
     assert int.from_bytes(first[8:10], "little") == 100
     assert len(first) == 25 + 1000
