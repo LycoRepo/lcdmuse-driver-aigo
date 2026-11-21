@@ -105,7 +105,7 @@ CHUNK = 1000                # 每包最多携带的 JPEG 字节
 KIND_IMAGE = 0x21
 
 
-def image_packets(jpeg: bytes, seq: int = 0, chunk: int = CHUNK,
+def image_packets(jpeg: bytes, seq: int = 256, chunk: int = CHUNK,
                   kind: int = KIND_IMAGE) -> list[bytes]:
     """把一张 JPEG 切成厂商格式的报文列表（每个 ≤1025 字节）。
 
@@ -121,7 +121,8 @@ def image_packets(jpeg: bytes, seq: int = 0, chunk: int = CHUNK,
         seq(2, 小端) 逐包 +1
         00 + 13 个 0
 
-    ``seq`` 由调用方跨帧递增；设备靠它按顺序拼帧。
+    ``seq`` 是**帧内**序号：厂商每帧都从 256 重新开始、逐包 +1（实测 seq 回到 256
+    才说明新帧开始）。跨帧继续递增会被设备当成同一条流丢弃，只有第一帧能显示。
     """
     if not jpeg:
         raise InvalidArgument("JPEG 为空")
@@ -189,6 +190,7 @@ class AigoXingcanlan(LcdComm):
         self._spec: dict[str, Any] = {}
         self._seq = 0
         self._realtime = False
+        self._need_wake = True
         self._frames = 0
         self._connected = False
         self._missed_acks = 0
@@ -271,6 +273,10 @@ class AigoXingcanlan(LcdComm):
                     self._size = (w, h)
             except Exception:
                 self._spec = {}
+
+        # 唤醒只在打开时做一次：命令帧和图像流不能交错，否则设备会把流丢掉（实测整屏黑）
+        self._wake()
+        self._need_wake = False
 
         return self.bind(DeviceInfo(
             id=info.id, name=info.name, width=self._size[0], height=self._size[1],
@@ -396,36 +402,46 @@ class AigoXingcanlan(LcdComm):
         img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=False)
         jpeg = buf.getvalue()
 
-        self._wake()
+        if self._need_wake:
+            self._wake()
+            self._need_wake = False
 
-        packets = image_packets(jpeg, self._seq)
+        seq_start = int(self.config.get("seq_start") if self.config.get("seq_start") is not None else 256)
+        packets = image_packets(jpeg, seq_start)
         gap = float(self.config.get("packet_gap") or 0.002)
         for packet in packets:
             self._dev.write(packet)
             if gap > 0:
                 time.sleep(gap)
-        self._seq = (self._seq + len(packets)) & 0xFFFF
+        self._seq = seq_start + len(packets)
         self._frames += 1
 
     def _wake(self) -> None:
-        """推帧前把设备叫醒。
+        """推流前把设备调到「能显示」的状态，每一步都确认真的回 200。
 
         实测三件事缺一不可：
         - 背光会被固件按 60 秒无流量调暗到 0（`brightness` 拉回 100）
         - 必须处在 `mode 2`（可传输）；`mode 0` 时帧写得进去但屏上不显示
         - `realtimeDisplay {"enable":true}` 打开实时通道
+        任何一步没确认成功就抛 DeviceBusy，让上层重开设备，而不是往黑屏里灌帧。
         """
-        now = time.time()
-        if now - getattr(self, "_last_wake", 0.0) < 4.0:
-            return
-        self._last_wake = now
-        want = int(self.config.get("brightness") or 100)
-        mode = int(self.config.get("mode") if self.config.get("mode") is not None else 2)
-        for action in (lambda: self._brightness(want),
-                       lambda: self.set_mode(mode),
-                       lambda: self.start_realtime(True)):
-            with contextlib.suppress(Exception):
-                action()
+        steps = (
+            ("brightness", lambda: self._brightness(int(self.config.get("brightness") or 100))),
+            ("mode", lambda: self.set_mode(int(
+                self.config.get("mode") if self.config.get("mode") is not None else 2))),
+            ("realtimeDisplay", lambda: self.start_realtime(True)),
+        )
+        for name, action in steps:
+            for attempt in range(3):
+                resp = None
+                with contextlib.suppress(Exception):
+                    resp = action()
+                if resp is not None and resp.get("status") == 200:
+                    break
+                time.sleep(0.3)
+            else:
+                raise DeviceBusy(f"唤醒失败：{name} 三次都没回 200，屏可能处于休眠/错误状态")
+        self._last_wake = time.time()
 
     def _brightness(self, value: int) -> dict[str, Any] | None:
         import json as _json
@@ -437,34 +453,13 @@ class AigoXingcanlan(LcdComm):
         raise Unsupported("爱国者 星璨岚 目前只按整帧推")
 
     def tick(self, now: float) -> None:
-        """保活：这台固件 60 秒收不到主机流量就把亮度降到 0（屏变黑）。
+        """不要在这里发命令帧。
 
-        所以每 keepalive_seconds 秒发一次 conn；发现 brightness 被系统调没了
-        就顺手拉回配置值（默认 100）。
+        这台固件把 HID 当成一条图像流：中途插进 `conn`/`brightness` 这类 5A 命令帧，
+        流的拼接就断了，屏会直接黑掉（实测）。唤醒只在 `open()` 里做一次，
+        之后再需要唤醒就等重新打开设备。
         """
-        interval = float(self.config.get("keepalive_seconds") or 20)
-        last = getattr(self, "_last_tick", 0.0)
-        if now - last < interval:
-            return
-        self._last_tick = now
-        if self._dev is None:
-            return
-        try:
-            resp = self.request("POST", "conn", {}, b"", timeout=1.0)
-            payload = (resp or {}).get("payload") or b""
-            if not payload:
-                return
-            import json
-            state = json.loads(payload)
-        except Exception:
-            return
-        if int(state.get("brightness") or 0) == 0:
-            want = int(self.config.get("brightness") or 100)
-            import json
-            body = json.dumps({"value": want}).encode()
-            with contextlib.suppress(Exception):
-                self.request("POST", "brightness",
-                             {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.0)
+        return
 
     def status(self) -> dict[str, Any]:
         return {"driver": self.driver_id, "size": list(self._size), "seq": self._seq,

@@ -114,7 +114,9 @@ def test_push_frame_writes_packets_and_advances_seq(monkeypatch):
     assert all(w[1] == 0x5C for w in dev.writes)
     assert all(w[6] == len(dev.writes) for w in dev.writes)
     assert drv.status()["frames"] == 1
-    assert drv.status()["seq"] == len(dev.writes)
+    # 每帧 seq 从 256 开始（厂商实测），所以推完 = 256 + 包数
+    assert drv.status()["seq"] == 256 + len(dev.writes)
+    assert int.from_bytes(dev.writes[0][8:10], "little") == 256
 
 
 def test_push_frame_requires_open_device():
