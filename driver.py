@@ -100,6 +100,50 @@ def build_body(method: str, resource: str, headers: Mapping[str, Any] | None = N
     return bytes(head) + payload
 
 
+PACKET_HEADER = 21          # 报头里 LEN 之后的固定字段数（4..24 共 21 字节）
+CHUNK = 1000                # 每包最多携带的 JPEG 字节
+KIND_IMAGE = 0x21
+
+
+def image_packets(jpeg: bytes, seq: int = 0, chunk: int = CHUNK,
+                  kind: int = KIND_IMAGE) -> list[bytes]:
+    """把一张 JPEG 切成厂商格式的报文列表（每个 ≤1025 字节）。
+
+    实测报头（25 字节，含 hidapi 的 report id）::
+
+        00        report id
+        5C        magic
+        LEN(2, 大端) = 本包长度 - 4
+        kind      0x21 图片
+        00
+        N         整帧包数
+        00
+        seq(2, 小端) 逐包 +1
+        00 + 13 个 0
+
+    ``seq`` 由调用方跨帧递增；设备靠它按顺序拼帧。
+    """
+    if not jpeg:
+        raise InvalidArgument("JPEG 为空")
+    chunks = [jpeg[i:i + chunk] for i in range(0, len(jpeg), chunk)]
+    total = len(chunks)
+    if total > 255:
+        raise InvalidArgument(f"单帧 {total} 包超出报头 blockCount 字段（≤255）")
+    out: list[bytes] = []
+    for index, piece in enumerate(chunks):
+        head = bytearray(25)
+        head[0] = 0x00                       # report id
+        head[1] = 0x5C                       # magic
+        head[2:4] = (PACKET_HEADER + len(piece)).to_bytes(2, "big")
+        head[4] = kind
+        head[5] = 0x00
+        head[6] = total
+        head[7] = 0x00
+        head[8:10] = ((seq + index) & 0xFFFF).to_bytes(2, "little")
+        out.append(bytes(head) + piece)
+    return out
+
+
 def parse_reply(raw: bytes) -> dict[str, Any] | None:
     """从若干报文拼出的字节流里解一帧回复。"""
     if DELIM not in raw:
@@ -330,88 +374,88 @@ class AigoXingcanlan(LcdComm):
                             {"ContentType": "json", "ContentLength": len(body)}, body)
 
     def push_frame(self, frame: Frame) -> None:
+        """推一帧。
+
+        格式是抓包实测出来的：25 字节报头 + 最多 1000 字节 JPEG，
+        整帧切成若干 ≤1025 字节的 HID 报文连续写出，seq 跨帧递增。
+        """
         import io
 
         if (frame.width, frame.height) != self._size:
             raise InvalidArgument(f"帧尺寸 {frame.size} 与设备 {self._size} 不一致")
+        if self._dev is None:
+            raise DeviceOffline("设备未打开")
 
         img = frame.to_image()
-        # 设备自己带 degree（这台是 270），所以默认不再预旋转；要手工转再设 rotation
         rotation = int(self.config.get("rotation") or 0)
         if rotation % 360:
             img = img.rotate(-rotation % 360, expand=False)
 
-        # 传输格式：厂商实测走的是 JPEG(q70, ~133KB)；调色板 PNG 是我们早先的用法。
-        fmt = str(self.config.get("frame_format") or "png").lower()
-        if fmt == "jpeg":
-            quality = int(self.config.get("jpeg_quality") or 70)
-            buf = io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=False)
-            png = buf.getvalue()
-            content_type = "image/jpeg"
-            ext = "jpg"
-        else:
-            colors = int(self.config.get("png_colors") or 128)
-            if colors > 0:
-                from PIL import Image
-                img = img.convert("RGB").quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG", optimize=True)
-            png = buf.getvalue()
-            content_type = "image/png"
-            ext = "png"
+        quality = int(self.config.get("jpeg_quality") or 70)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=False)
+        jpeg = buf.getvalue()
 
-        mode = self.config.get("mode")
-        if mode is not None:
-            with contextlib.suppress(Exception):
-                self.set_mode(int(mode))
-        # 设备偶尔会自己退出实时模式：起始帧收不到回包就重新进一次，
-        # 否则画面会停在上一张（写是成功的，屏上却不动）。
-        if time.time() - getattr(self, "_last_beat", 0) > 4.0:
-            with contextlib.suppress(Exception):
-                self.heartbeat()
-                self._last_beat = time.time()
-        if not self._realtime or (self._frames % 30 == 0):
-            try:
-                self.start_realtime(True)
-                self._realtime = True
-            except Exception as exc:
-                self._realtime = False
-                log = getattr(self, "log", None)
-                if log:
-                    log.warning("进实时模式失败: %s", exc)
+        self._wake()
 
-        name = str(self.config.get("file_name") or f"lcdmuse.{ext}")
-        total = (len(png) + BLOCK_SIZE - 1) // BLOCK_SIZE
-        chunk_timeout = float(self.config.get("chunk_timeout") or 1.0)
-
-        start = None
-        for _ in range(3):
-            start = self.request("POST", _RESOURCES["transport"],
-                                 {"FileName": name, "FileSize": len(png), "ContentType": content_type,
-                                  "blockCount": total, "ContentLength": 0}, b"", timeout=chunk_timeout)
-            if start is not None:
-                break
-        if start is not None and start["status"] != 200:
-            raise DeviceOffline(f"传输起始被拒: {start['status']}")
-        if start is None:
-            self._missed_acks += 1
-            self._realtime = False      # 下次推帧前重进实时模式
-
-        for index in range(total):
-            piece = png[index * BLOCK_SIZE:(index + 1) * BLOCK_SIZE]
-            headers = {"FileName": name, "FileSize": len(png), "ContentType": content_type,
-                       "blockCount": total, "currentBlockIndex": index,
-                       "ContentRange": f"{index * BLOCK_SIZE}-{index * BLOCK_SIZE + len(piece) - 1}",
-                       "ContentLength": len(piece)}
-            if index == total - 1:
-                headers["isEnded"] = 1
-            self._write("POST", _RESOURCES["transport"], headers, piece)
+        packets = image_packets(jpeg, self._seq)
+        gap = float(self.config.get("packet_gap") or 0.002)
+        for packet in packets:
+            self._dev.write(packet)
+            if gap > 0:
+                time.sleep(gap)
+        self._seq = (self._seq + len(packets)) & 0xFFFF
         self._frames += 1
-        self.request("POST", "conn", timeout=1.0)      # 发完对一次账，顺便把回包清干净
+
+    def _wake(self) -> None:
+        """背光会被固件按 60 秒无流量调暗到 0，推帧前确保亮着且处于实时模式。"""
+        now = time.time()
+        if now - getattr(self, "_last_wake", 0.0) < 4.0:
+            return
+        self._last_wake = now
+        want = int(self.config.get("brightness") or 100)
+        for action in (lambda: self._brightness(want), lambda: self.start_realtime(True)):
+            with contextlib.suppress(Exception):
+                action()
+
+    def _brightness(self, value: int) -> dict[str, Any] | None:
+        import json as _json
+        body = _json.dumps({"value": int(value)}).encode()
+        return self.request("POST", "brightness",
+                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.5)
 
     def push_region(self, frame: Frame, x: int, y: int) -> None:
         raise Unsupported("爱国者 星璨岚 目前只按整帧推")
+
+    def tick(self, now: float) -> None:
+        """保活：这台固件 60 秒收不到主机流量就把亮度降到 0（屏变黑）。
+
+        所以每 keepalive_seconds 秒发一次 conn；发现 brightness 被系统调没了
+        就顺手拉回配置值（默认 100）。
+        """
+        interval = float(self.config.get("keepalive_seconds") or 20)
+        last = getattr(self, "_last_tick", 0.0)
+        if now - last < interval:
+            return
+        self._last_tick = now
+        if self._dev is None:
+            return
+        try:
+            resp = self.request("POST", "conn", {}, b"", timeout=1.0)
+            payload = (resp or {}).get("payload") or b""
+            if not payload:
+                return
+            import json
+            state = json.loads(payload)
+        except Exception:
+            return
+        if int(state.get("brightness") or 0) == 0:
+            want = int(self.config.get("brightness") or 100)
+            import json
+            body = json.dumps({"value": want}).encode()
+            with contextlib.suppress(Exception):
+                self.request("POST", "brightness",
+                             {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.0)
 
     def status(self) -> dict[str, Any]:
         return {"driver": self.driver_id, "size": list(self._size), "seq": self._seq,

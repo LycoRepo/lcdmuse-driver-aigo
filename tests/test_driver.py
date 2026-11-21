@@ -61,44 +61,65 @@ def test_parse_reply_rejects_bad_checksum():
     assert driver.parse_reply(bytes(frame)) is None
 
 
-def test_push_frame_streams_realtime_then_blocks(monkeypatch):
-    """推帧 = realtimeDisplay enable + transport 起始 + N 个数据块，块头带 currentBlockIndex。"""
-    drv = driver.AigoXingcanlan({})
-    drv._size = (16, 8)
-    calls = []
+class FakeHid:
+    """记录写出的报文，模拟 hidapi 设备。"""
 
-    def fake_request(method, resource, headers=None, payload=b"", timeout=None):
-        calls.append((method, resource, dict(headers or {}), len(payload)))
+    def __init__(self):
+        self.writes = []
+
+    def write(self, data):
+        self.writes.append(bytes(data))
+        return len(data)
+
+
+def test_image_packets_layout():
+    """报头 25 字节：report id / 5C / LEN(大端) / kind / 00 / N / 00 / seq(小端)。"""
+    jpeg = bytes(range(256)) * 9                    # 2304 字节 → 3 包
+    packets = driver.image_packets(jpeg, seq=100)
+
+    assert len(packets) == 3
+    first = packets[0]
+    assert first[0] == 0x00
+    assert first[1] == 0x5C
+    assert int.from_bytes(first[2:4], "big") == len(first) - 4
+    assert first[4] == 0x21
+    assert first[6] == 3                            # blockCount
+    assert int.from_bytes(first[8:10], "little") == 100
+    assert len(first) == 25 + 1000
+
+    assert int.from_bytes(packets[2][8:10], "little") == 102
+    assert len(packets[2]) == 25 + 304
+    assert b"".join(p[25:] for p in packets) == jpeg
+
+
+def test_image_packets_rejects_too_many_blocks():
+    with pytest.raises(InvalidArgument):
+        driver.image_packets(bytes(300 * 1000))
+
+
+def test_push_frame_writes_packets_and_advances_seq(monkeypatch):
+    drv = driver.AigoXingcanlan({"packet_gap": 0})
+    drv._size = (16, 8)
+    dev = FakeHid()
+
+    def fake_req(*args, **kwargs):
         return {"status": 200, "headers": {}, "payload": b""}
 
-    def fake_write(method, resource, headers=None, payload=b""):
-        calls.append((method, resource, dict(headers or {}), len(payload)))
+    monkeypatch.setattr(drv, "request", fake_req)
+    drv._dev = dev
+    drv.push_frame(Frame(width=16, height=8, data=bytes(16 * 8 * 3)))
 
-    monkeypatch.setattr(drv, "request", fake_request)
-    monkeypatch.setattr(drv, "_write", fake_write)
-    frame = Frame(width=16, height=8, data=bytes(16 * 8 * 3))
-    drv.push_frame(frame)
-
-    resources = [c[1] for c in calls]
-    # 顺序：先心跳（STATE all），再进实时模式，再传文件
-    assert resources[0] == "all"
-    assert "realtimeDisplay" in resources
-    assert resources.index("realtimeDisplay") < resources.index("transport")
-    blocks = [c for c in calls if c[1] == "transport"][1:]
-    assert blocks, "至少要有一块数据"
-    assert blocks[0][2]["currentBlockIndex"] == 0
-    assert blocks[-1][2]["isEnded"] == 1
+    assert len(dev.writes) >= 1
+    assert all(len(w) <= 1025 for w in dev.writes)
+    assert all(w[1] == 0x5C for w in dev.writes)
+    assert all(w[6] == len(dev.writes) for w in dev.writes)
     assert drv.status()["frames"] == 1
+    assert drv.status()["seq"] == len(dev.writes)
 
 
-def test_push_frame_fails_when_start_rejected(monkeypatch):
+def test_push_frame_requires_open_device():
     drv = driver.AigoXingcanlan({})
     drv._size = (16, 8)
-
-    def fake_request(method, resource, headers=None, payload=b"", timeout=None):
-        return {"status": 400, "headers": {}, "payload": b""}
-
-    monkeypatch.setattr(drv, "request", fake_request)
     with pytest.raises(DeviceOffline):
         drv.push_frame(Frame(width=16, height=8, data=bytes(16 * 8 * 3)))
 
