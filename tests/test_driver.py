@@ -127,3 +127,22 @@ def test_push_frame_requires_open_device():
 def test_probe_returns_none_without_device(monkeypatch):
     monkeypatch.setattr(driver.AigoXingcanlan, "_find_device", staticmethod(lambda: None))
     assert driver.AigoXingcanlan.probe({}) is None
+
+def test_wake_sets_mode_two_and_brightness(monkeypatch):
+    """推帧前必须切到 mode 2（mode 0 时帧不显示），并把亮度拉回来。"""
+    drv = driver.AigoXingcanlan({})
+    seen = []
+
+    def fake_request(method, resource, headers=None, payload=b"", timeout=None):
+        seen.append((resource, payload))
+        return {"status": 200, "headers": {}, "payload": b""}
+
+    monkeypatch.setattr(drv, "request", fake_request)
+    drv._wake()
+
+    resources = [r for r, _ in seen]
+    assert "brightness" in resources
+    assert "mode" in resources
+    assert "realtimeDisplay" in resources
+    mode_body = next(p for r, p in seen if r == "mode")
+    assert b'"value":2' in mode_body.replace(b" ", b"")

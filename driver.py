@@ -408,13 +408,22 @@ class AigoXingcanlan(LcdComm):
         self._frames += 1
 
     def _wake(self) -> None:
-        """背光会被固件按 60 秒无流量调暗到 0，推帧前确保亮着且处于实时模式。"""
+        """推帧前把设备叫醒。
+
+        实测三件事缺一不可：
+        - 背光会被固件按 60 秒无流量调暗到 0（`brightness` 拉回 100）
+        - 必须处在 `mode 2`（可传输）；`mode 0` 时帧写得进去但屏上不显示
+        - `realtimeDisplay {"enable":true}` 打开实时通道
+        """
         now = time.time()
         if now - getattr(self, "_last_wake", 0.0) < 4.0:
             return
         self._last_wake = now
         want = int(self.config.get("brightness") or 100)
-        for action in (lambda: self._brightness(want), lambda: self.start_realtime(True)):
+        mode = int(self.config.get("mode") if self.config.get("mode") is not None else 2)
+        for action in (lambda: self._brightness(want),
+                       lambda: self.set_mode(mode),
+                       lambda: self.start_realtime(True)):
             with contextlib.suppress(Exception):
                 action()
 
