@@ -1,0 +1,21 @@
+id: aigo_xingcanlan
+name: 爱国者 星璨岚 屏显版（1480×720 HID）
+version: 0.1.0
+api: 1
+min_core: "0.1.0"
+entry: driver:AigoXingcanlan
+platforms: [windows, linux, darwin]
+requires: [hid]
+description: 爱国者星璨岚机箱屏：Baiyi 方案 HID（1024 字节报文，0x5A 帧 + HTTP 风格负载）；推图通路待实测
+enabled_by_default: false
+settings_schema:
+  spec_resource:
+    {type: str, default: "spec", label: 设备规格 resource}
+  image_resource:
+    {type: str, default: "", label: 推图 resource, hint: 留空则拒绝送帧；抓到 AIGO.exe 的请求后填这里}
+  jpeg_quality:
+    {type: int, default: 85, label: JPEG 质量, min: 30, max: 95}
+  rotation:
+    {type: int, default: 0, label: 额外旋转}
+  timeout:
+    {type: float, default: 1.5, label: 请求超时（秒）}
