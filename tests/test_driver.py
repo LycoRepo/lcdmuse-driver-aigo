@@ -80,8 +80,10 @@ def test_push_frame_streams_realtime_then_blocks(monkeypatch):
     drv.push_frame(frame)
 
     resources = [c[1] for c in calls]
-    assert resources[0] == "realtimeDisplay"
-    assert resources[1] == "transport"
+    # 顺序：先心跳（STATE all），再进实时模式，再传文件
+    assert resources[0] == "all"
+    assert "realtimeDisplay" in resources
+    assert resources.index("realtimeDisplay") < resources.index("transport")
     blocks = [c for c in calls if c[1] == "transport"][1:]
     assert blocks, "至少要有一块数据"
     assert blocks[0][2]["currentBlockIndex"] == 0

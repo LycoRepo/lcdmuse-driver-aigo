@@ -26,6 +26,7 @@ push_frame 会明确拒绝，而不是假装成功。
 """
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Mapping
 from typing import Any, ClassVar
@@ -203,6 +204,13 @@ class AigoXingcanlan(LcdComm):
 
         # 握手：POST conn（实测回 200 + 设备 JSON：version/space/brightness/degree/sn）
         spec = self.request("POST", self.config.get("conn_resource") or "conn")
+        # 厂商的顺序：conn → STATE all heartbeat → power resume → realtimeDisplay enable。
+        # 少了 heartbeat / resume，设备会收下报文字节但**不换画面**（今天实测到的就是这个）。
+        self.heartbeat()
+        self.power_event("resume")
+        with contextlib.suppress(Exception):
+            self.start_realtime(True)
+            self._realtime = True
         if spec and spec.get("payload"):
             try:
                 self._connected = True
@@ -262,6 +270,15 @@ class AigoXingcanlan(LcdComm):
                         break
                     end = buf.index(DELIM, buf.index(DELIM) + 1) + 1
                     buf = buf[end:]
+                    # 只认属于本次请求的回复：设备每个请求都回 AckNumber=SeqNumber+1。
+                    # 不校验就会读到上一个请求的回复——实测曾因此把 400 看成 200。
+                    ack = (reply.get("headers") or {}).get("AckNumber")
+                    if ack is not None:
+                        try:
+                            if int(ack) != self._seq + 1:
+                                continue
+                        except ValueError:
+                            pass
                     return reply
             else:
                 time.sleep(0.01)
@@ -282,6 +299,30 @@ class AigoXingcanlan(LcdComm):
             raise DeviceOffline(f"HID 写入失败: {exc}") from exc
 
     # ── 送帧 ────────────────────────────────────────────────────────────
+    def set_mode(self, value: int) -> dict[str, Any] | None:
+        """切设备模式：payload 是 {"value": N}（不是 {"mode": N}，后者会被当成 0x7FFFFFFF）。
+
+        实测：0=默认 UI，2=可传输（推帧前设成 2）。
+        """
+        import json as _json
+        body = _json.dumps({"value": int(value)}).encode()
+        return self.request("POST", "mode",
+                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.5)
+
+    def heartbeat(self) -> dict[str, Any] | None:
+        """STATE all + {"heartbeat":1}：设备靠它认为"对面还活着"。"""
+        import json as _json
+        body = _json.dumps({"heartbeat": 1}).encode()
+        return self.request("STATE", "all",
+                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.0)
+
+    def power_event(self, event: str = "resume") -> dict[str, Any] | None:
+        """power resume/suspend：不 resume 的话，传输成功但画面不刷新。"""
+        import json as _json
+        body = _json.dumps({"event": event}).encode()
+        return self.request("POST", "power",
+                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.5)
+
     def start_realtime(self, enable: bool = True) -> dict[str, Any] | None:
         """进/出实时显示模式（实测：{"enable":true} → 200）。"""
         body = b'{"enable":true}' if enable else b'{"enable":false}'
@@ -300,17 +341,36 @@ class AigoXingcanlan(LcdComm):
         if rotation % 360:
             img = img.rotate(-rotation % 360, expand=False)
 
-        colors = int(self.config.get("png_colors") or 128)
-        if colors > 0:
-            from PIL import Image
-            img = img.convert("RGB").quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+        # 传输格式：厂商实测走的是 JPEG(q70, ~133KB)；调色板 PNG 是我们早先的用法。
+        fmt = str(self.config.get("frame_format") or "png").lower()
+        if fmt == "jpeg":
+            quality = int(self.config.get("jpeg_quality") or 70)
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=False)
+            png = buf.getvalue()
+            content_type = "image/jpeg"
+            ext = "jpg"
+        else:
+            colors = int(self.config.get("png_colors") or 128)
+            if colors > 0:
+                from PIL import Image
+                img = img.convert("RGB").quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG", optimize=True)
+            png = buf.getvalue()
+            content_type = "image/png"
+            ext = "png"
 
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        png = buf.getvalue()
-
+        mode = self.config.get("mode")
+        if mode is not None:
+            with contextlib.suppress(Exception):
+                self.set_mode(int(mode))
         # 设备偶尔会自己退出实时模式：起始帧收不到回包就重新进一次，
         # 否则画面会停在上一张（写是成功的，屏上却不动）。
+        if time.time() - getattr(self, "_last_beat", 0) > 4.0:
+            with contextlib.suppress(Exception):
+                self.heartbeat()
+                self._last_beat = time.time()
         if not self._realtime or (self._frames % 30 == 0):
             try:
                 self.start_realtime(True)
@@ -321,14 +381,14 @@ class AigoXingcanlan(LcdComm):
                 if log:
                     log.warning("进实时模式失败: %s", exc)
 
-        name = str(self.config.get("file_name") or "lcdmuse.png")
+        name = str(self.config.get("file_name") or f"lcdmuse.{ext}")
         total = (len(png) + BLOCK_SIZE - 1) // BLOCK_SIZE
         chunk_timeout = float(self.config.get("chunk_timeout") or 1.0)
 
         start = None
         for _ in range(3):
             start = self.request("POST", _RESOURCES["transport"],
-                                 {"FileName": name, "FileSize": len(png), "ContentType": "image/png",
+                                 {"FileName": name, "FileSize": len(png), "ContentType": content_type,
                                   "blockCount": total, "ContentLength": 0}, b"", timeout=chunk_timeout)
             if start is not None:
                 break
@@ -340,7 +400,7 @@ class AigoXingcanlan(LcdComm):
 
         for index in range(total):
             piece = png[index * BLOCK_SIZE:(index + 1) * BLOCK_SIZE]
-            headers = {"FileName": name, "FileSize": len(png), "ContentType": "image/png",
+            headers = {"FileName": name, "FileSize": len(png), "ContentType": content_type,
                        "blockCount": total, "currentBlockIndex": index,
                        "ContentRange": f"{index * BLOCK_SIZE}-{index * BLOCK_SIZE + len(piece) - 1}",
                        "ContentLength": len(piece)}
