@@ -83,10 +83,30 @@ def main() -> int:
         return {}
 
     call("Runtime.enable")
-    r = wait(call("Runtime.evaluate", expression=PATCH, returnByValue=True,
-                  includeCommandLineAPI=True))
-    print("打钩:", ((r.get("result") or {}).get("result") or {}).get("value"))
-    call("Runtime.runIfWaitingForDebugger")
+    call("Debugger.enable")
+
+    # --inspect-brk 会把主进程停在第一行，这时全局作用域里没有 require、也没有
+    # process.mainModule（还没赋值），所以必须在「暂停的那个调用帧」里求值，
+    # 那里才能拿到模块的 require。这是上次「打钩: None」的原因。
+    paused = None
+    end = time.time() + 30
+    while time.time() < end and paused is None:
+        msg = json.loads(ws.recv())
+        if msg.get("method") == "Debugger.paused":
+            paused = msg["params"]
+    if paused is None:
+        print("没收到 Debugger.paused（可能没有用 --inspect-brk 启动）")
+    else:
+        frame_id = paused["callFrames"][0]["callFrameId"]
+        call("Debugger.evaluateOnCallFrame", callFrameId=frame_id, expression=PATCH,
+             returnByValue=True)
+        r = wait(seq)
+        value = ((r.get("result") or {}).get("result") or {}).get("value")
+        print("打钩:", value, (r.get("result") or {}).get("exceptionDetails", {}).get("text", ""))
+        if value != "patched":
+            print("在调用帧里也失败，先不继续")
+            return 2
+        call("Debugger.resume")
     print(f"放行，录 {seconds} 秒 → {OUT}")
     time.sleep(seconds)
     r = wait(call("Runtime.evaluate", expression="globalThis.__lcdCount || 0", returnByValue=True))
