@@ -9,13 +9,15 @@ requires: [hid]
 description: 爱国者星璨岚机箱屏：Baiyi 方案 HID（1024 字节报文，0x5A 帧 + HTTP 风格负载）；推图通路待实测
 enabled_by_default: false
 settings_schema:
-  spec_resource:
-    {type: str, default: "spec", label: 设备规格 resource}
-  image_resource:
-    {type: str, default: "", label: 推图 resource, hint: 留空则拒绝送帧；抓到 AIGO.exe 的请求后填这里}
-  jpeg_quality:
-    {type: int, default: 85, label: JPEG 质量, min: 30, max: 95}
+  conn_resource:
+    {type: str, default: "conn", label: 握手 resource, hint: POST conn 回设备 JSON}
+  file_name:
+    {type: str, default: "lcdmuse.png", label: 传输时上报的文件名}
   rotation:
-    {type: int, default: 0, label: 额外旋转}
+    {type: int, default: 0, label: 额外旋转, hint: 设备自带 degree=270，一般不用再转}
+  png_colors:
+    {type: int, default: 128, label: PNG 调色板色数, min: 0, max: 256, hint: 0=真彩；64~128 能把帧压到 8~15KB，快很多}
+  chunk_timeout:
+    {type: float, default: 3.0, label: 单块超时（秒）}
   timeout:
     {type: float, default: 1.5, label: 请求超时（秒）}

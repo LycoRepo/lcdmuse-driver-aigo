@@ -38,6 +38,10 @@ VID_HINTS = (0x1D6B, 0x1C75, 0x0B05)     # 固件换过厂商 id，认 PID 更�
 REPORT_SIZE = 1024
 DELIM = 0x5A
 DEFAULT_SIZE = (1480, 720)
+HEADER_BUDGET = REPORT_SIZE - 9          # 单帧可用字节（含 HTTP 头）
+BLOCK_SIZE = 700                         # 头部约 300 字节，留余量
+
+_RESOURCES = {"conn": "conn", "realtime": "realtimeDisplay", "transport": "transport"}
 
 METHODS = ("GET", "POST", "DELETE", "STATE")
 
@@ -139,6 +143,9 @@ class AigoXingcanlan(LcdComm):
         self._size = DEFAULT_SIZE
         self._spec: dict[str, Any] = {}
         self._seq = 0
+        self._realtime = False
+        self._frames = 0
+        self._connected = False
 
     # ── 探测 ────────────────────────────────────────────────────────────
     @classmethod
@@ -193,8 +200,13 @@ class AigoXingcanlan(LcdComm):
             self.close()
             raise DeviceBusy(f"HID 打不开（多半被 AIGO.exe 占着）: {exc}") from exc
 
-        # 问一句设备规格；答不上来不算失败，只是分辨率按公开参数走
-        spec = self.request("GET", self.config.get("spec_resource") or "spec")
+        # 握手：POST conn（实测回 200 + 设备 JSON：version/space/brightness/degree/sn）
+        spec = self.request("POST", self.config.get("conn_resource") or "conn")
+        if spec and spec.get("payload"):
+            try:
+                self._connected = True
+            except Exception:
+                pass
         if spec and spec.get("payload"):
             try:
                 import json
@@ -252,34 +264,64 @@ class AigoXingcanlan(LcdComm):
         return None
 
     # ── 送帧 ────────────────────────────────────────────────────────────
+    def start_realtime(self, enable: bool = True) -> dict[str, Any] | None:
+        """进/出实时显示模式（实测：{"enable":true} → 200）。"""
+        body = b'{"enable":true}' if enable else b'{"enable":false}'
+        return self.request("POST", _RESOURCES["realtime"],
+                            {"ContentType": "json", "ContentLength": len(body)}, body)
+
     def push_frame(self, frame: Frame) -> None:
-        resource = str(self.config.get("image_resource") or "").strip()
-        if not resource:
-            raise Unsupported(
-                "这块屏的推图 resource 还没实测确认（画面编码方式未知）。"
-                "拿到一次 AIGO.exe 的 HID 抓包后，把资源名填进 image_resource 即可启用。")
+        import io
+
         if (frame.width, frame.height) != self._size:
             raise InvalidArgument(f"帧尺寸 {frame.size} 与设备 {self._size} 不一致")
 
-        import io
         img = frame.to_image()
-        quality = int(self.config.get("jpeg_quality") or 85)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
-        jpeg = buf.getvalue()
+        # 设备自己带 degree（这台是 270），所以默认不再预旋转；要手工转再设 rotation
+        rotation = int(self.config.get("rotation") or 0)
+        if rotation % 360:
+            img = img.rotate(-rotation % 360, expand=False)
 
-        # 一整帧通常放不进一个报文，按块续传；块序号放进 SeqNumber
-        chunk = REPORT_SIZE - 9
-        total = (len(jpeg) + chunk - 1) // chunk
+        colors = int(self.config.get("png_colors") or 128)
+        if colors > 0:
+            from PIL import Image
+            img = img.convert("RGB").quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        png = buf.getvalue()
+
+        if not self._realtime:
+            self.start_realtime(True)
+            self._realtime = True
+
+        name = str(self.config.get("file_name") or "lcdmuse.png")
+        total = (len(png) + BLOCK_SIZE - 1) // BLOCK_SIZE
+        chunk_timeout = float(self.config.get("chunk_timeout") or 3.0)
+
+        start = self.request("POST", _RESOURCES["transport"],
+                             {"FileName": name, "FileSize": len(png), "ContentType": "image/png",
+                              "blockCount": total, "ContentLength": 0}, b"", timeout=chunk_timeout)
+        if start is None or start["status"] != 200:
+            raise DeviceOffline(f"传输起始被拒: {None if start is None else start['status']}")
+
         for index in range(total):
-            piece = jpeg[index * chunk:(index + 1) * chunk]
-            self.request("POST", resource,
-                         {"ChunkIndex": index, "ChunkTotal": total, "ContentLength": len(piece)},
-                         piece, timeout=float(self.config.get("chunk_timeout") or 2.0))
+            piece = png[index * BLOCK_SIZE:(index + 1) * BLOCK_SIZE]
+            headers = {"FileName": name, "FileSize": len(png), "ContentType": "image/png",
+                       "blockCount": total, "currentBlockIndex": index,
+                       "ContentRange": f"{index * BLOCK_SIZE}-{index * BLOCK_SIZE + len(piece) - 1}",
+                       "ContentLength": len(piece)}
+            if index == total - 1:
+                headers["isEnded"] = 1
+            reply = self.request("POST", _RESOURCES["transport"], headers, piece, timeout=chunk_timeout)
+            if reply is None or reply["status"] != 200:
+                raise DeviceOffline(f"第 {index}/{total} 块被拒: {None if reply is None else reply['status']}")
+        self._frames += 1
 
     def push_region(self, frame: Frame, x: int, y: int) -> None:
         raise Unsupported("爱国者 星璨岚 目前只按整帧推")
 
     def status(self) -> dict[str, Any]:
         return {"driver": self.driver_id, "size": list(self._size), "seq": self._seq,
+                "frames": self._frames, "realtime": self._realtime,
                 "open": self._dev is not None, "spec": self._spec or None}

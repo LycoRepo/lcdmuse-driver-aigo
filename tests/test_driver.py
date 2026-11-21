@@ -11,7 +11,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 import driver  # noqa: E402
-from lcdmuse.lcd_comm import Frame, InvalidArgument, Unsupported  # noqa: E402
+from lcdmuse.lcd_comm import DeviceOffline, Frame, InvalidArgument  # noqa: E402
 
 
 def test_stuff_and_unstuff_round_trip():
@@ -61,11 +61,40 @@ def test_parse_reply_rejects_bad_checksum():
     assert driver.parse_reply(bytes(frame)) is None
 
 
-def test_push_frame_refuses_until_resource_configured():
-    drv = driver.AigoXingcanlan({"image_resource": ""})
-    drv._size = (1480, 720)
-    with pytest.raises(Unsupported):
-        drv.push_frame(Frame(width=1480, height=720, data=b"\x00" * (1480 * 720 * 3)))
+def test_push_frame_streams_realtime_then_blocks(monkeypatch):
+    """推帧 = realtimeDisplay enable + transport 起始 + N 个数据块，块头带 currentBlockIndex。"""
+    drv = driver.AigoXingcanlan({})
+    drv._size = (16, 8)
+    calls = []
+
+    def fake_request(method, resource, headers=None, payload=b"", timeout=None):
+        calls.append((method, resource, dict(headers or {}), len(payload)))
+        return {"status": 200, "headers": {}, "payload": b""}
+
+    monkeypatch.setattr(drv, "request", fake_request)
+    frame = Frame(width=16, height=8, data=bytes(16 * 8 * 3))
+    drv.push_frame(frame)
+
+    resources = [c[1] for c in calls]
+    assert resources[0] == "realtimeDisplay"
+    assert resources[1] == "transport"
+    blocks = [c for c in calls if c[1] == "transport"][1:]
+    assert blocks, "至少要有一块数据"
+    assert blocks[0][2]["currentBlockIndex"] == 0
+    assert blocks[-1][2]["isEnded"] == 1
+    assert drv.status()["frames"] == 1
+
+
+def test_push_frame_fails_when_start_rejected(monkeypatch):
+    drv = driver.AigoXingcanlan({})
+    drv._size = (16, 8)
+
+    def fake_request(method, resource, headers=None, payload=b"", timeout=None):
+        return {"status": 400, "headers": {}, "payload": b""}
+
+    monkeypatch.setattr(drv, "request", fake_request)
+    with pytest.raises(DeviceOffline):
+        drv.push_frame(Frame(width=16, height=8, data=bytes(16 * 8 * 3)))
 
 
 def test_probe_returns_none_without_device(monkeypatch):
