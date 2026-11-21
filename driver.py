@@ -309,9 +309,17 @@ class AigoXingcanlan(LcdComm):
         img.save(buf, format="PNG", optimize=True)
         png = buf.getvalue()
 
-        if not self._realtime:
-            self.start_realtime(True)
-            self._realtime = True
+        # 设备偶尔会自己退出实时模式：起始帧收不到回包就重新进一次，
+        # 否则画面会停在上一张（写是成功的，屏上却不动）。
+        if not self._realtime or (self._frames % 30 == 0):
+            try:
+                self.start_realtime(True)
+                self._realtime = True
+            except Exception as exc:
+                self._realtime = False
+                log = getattr(self, "log", None)
+                if log:
+                    log.warning("进实时模式失败: %s", exc)
 
         name = str(self.config.get("file_name") or "lcdmuse.png")
         total = (len(png) + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -328,6 +336,7 @@ class AigoXingcanlan(LcdComm):
             raise DeviceOffline(f"传输起始被拒: {start['status']}")
         if start is None:
             self._missed_acks += 1
+            self._realtime = False      # 下次推帧前重进实时模式
 
         for index in range(total):
             piece = png[index * BLOCK_SIZE:(index + 1) * BLOCK_SIZE]
