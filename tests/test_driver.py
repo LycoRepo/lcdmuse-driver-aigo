@@ -10,8 +10,9 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-import driver  # noqa: E402
-from lcdmuse.lcd_comm import DeviceOffline, Frame, InvalidArgument  # noqa: E402
+from lcdmuse.lcd_comm import DeviceOffline, Frame, InvalidArgument
+
+import driver
 
 
 def test_stuff_and_unstuff_round_trip():
@@ -114,9 +115,9 @@ def test_push_frame_writes_packets_and_advances_seq(monkeypatch):
     assert all(w[1] == 0x5C for w in dev.writes)
     assert all(w[6] == len(dev.writes) for w in dev.writes)
     assert drv.status()["frames"] == 1
-    # 每帧 seq 从 256 开始（厂商实测），所以推完 = 256 + 包数
-    assert drv.status()["seq"] == 256 + len(dev.writes)
+    # seq 是帧内序号：第一包必须是 256，后续逐包 +1
     assert int.from_bytes(dev.writes[0][8:10], "little") == 256
+    assert int.from_bytes(dev.writes[-1][8:10], "little") == 256 + len(dev.writes) - 1
 
 
 def test_push_frame_requires_open_device():

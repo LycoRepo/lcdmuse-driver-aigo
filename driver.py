@@ -1,57 +1,71 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""爱国者「星璨岚」屏显版驱动（USB HID 厂商自定义，1024 字节报文）。
+"""爱国者「星璨岚」屏显版驱动（USB HID，Baiyi／百一 平台，PID 0x0113）。
 
-这块屏和 ASUS ROG Ryuo IV 是同一套 Baiyi（百一）方案：
-厂商自定义 HID（usage page 0xFF00）、1024 字节报文、帧用 0x5A 包裹并做字节填充。
+这块屏走两条完全不同的通道，都是实测出来的：
 
-帧格式来自 ryuo-iv-screen 的逆向文档与实现
-（https://github.com/FoxPodZ/ryuo-iv-screen，GPL-3.0-or-later，作者 FoxPodZ (foxpodz.de)）。
-该仓库带 GPLv3 §7(b) 附加条款，要求保留作者署名与本链接；本文件与 README 均已保留，
-再分发时也请一并保留。
+1) 命令通道 —— 5A 包裹的「HTTP」报文，**一帧必须装进一个 1024 字节报文**：
 
-    5A | stuffed( LEN(2 BE) | BODY | CKSUM(1) ) | 5A
-    LEN   = len(BODY) + 5
-    CKSUM = sum(LEN + BODY) & 0xFF
-    填充  0x5A -> 5B 01，0x5B -> 5B 02（只对 LEN/BODY/CKSUM 做，不碰两端的 5A）
-    整帧必须装进一个 1024 字节报文，不足补零
+       5A | stuffed( LEN(2 BE) | BODY | CKSUM(1) ) | 5A
+       LEN = len(BODY) + 5      CKSUM = sum(LEN + BODY) & 0xFF
+       填充 0x5A→5B 01、0x5B→5B 02（只填 LEN/BODY/CKSUM，不碰两端 5A）
+       BODY = "<METHOD> <resource> 1\r\n" + "Key=Value\r\n"… + "\r\n" + payload
 
-BODY 是「重新发明的 HTTP」：
+   用于 conn（取设备信息）、brightness、mode、realtimeDisplay。
 
-    "<METHOD> <resource> 1\\r\\n" + 若干 "Key=Value\\r\\n" + "\\r\\n" + payload
-    方法：GET / POST / DELETE / STATE
+2) 图像通道 —— 0x5C 报头 + 原始 JPEG，每包 ≤1025 字节：
 
-本驱动目前做到「能把请求发出去、能把回复解出来」；具体哪个 resource 负责推图
-（画面是整帧 JPEG 还是别的编码）还没有实测样本，所以在 `image_resource` 没配置之前
-push_frame 会明确拒绝，而不是假装成功。
+       00 | 5C | LEN(2 BE) | 21 | 00 | 包数 | 00 | seq(2 LE) | 13×00 | ≤1000B JPEG
+       LEN = 本包长度 - 4
+
+   三条实测约束：
+   - seq 是**帧内**序号，每帧从 256 重新开始；跨帧累加会被当成同一条流的尾巴丢掉，
+     只有第一帧能显示（症状：第一次出图，之后画面永远不动）
+   - 设备必须处在 `mode 2`（可传输）；`mode 0` 时帧写得进、回包也 200，但屏上不显示
+   - 固件 60 秒无流量把亮度调回 0；唤醒只在 open 时做，之后不要再往流里插命令帧
+
+5A 信封格式参考 ryuo-iv-screen（GPL-3.0-or-later，作者 FoxPodZ，
+https://github.com/FoxPodZ/ryuo-iv-screen，带 GPLv3 §7(b) 署名要求，再分发请保留）。
+0x5C 图像报头来自对官方软件 HID 写入的抓包分析。
 """
 from __future__ import annotations
 
 import contextlib
+import io
+import json
 import time
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
-from lcdmuse.lcd_comm import (Capability, DeviceBusy, DeviceInfo, DeviceNotFound, DeviceOffline, Frame,
-                              InvalidArgument, LcdComm, Unsupported)
+from lcdmuse.lcd_comm import (
+    Capability,
+    DeviceBusy,
+    DeviceInfo,
+    DeviceNotFound,
+    DeviceOffline,
+    Frame,
+    InvalidArgument,
+    LcdComm,
+    Unsupported,
+)
 
 PID = 0x0113
-VID_HINTS = (0x1D6B, 0x1C75, 0x0B05)     # 固件换过厂商 id，认 PID 更稳
-REPORT_SIZE = 1024
-DELIM = 0x5A
+REPORT_SIZE = 1024                  # 命令通道报文长度
 DEFAULT_SIZE = (1480, 720)
-HEADER_BUDGET = REPORT_SIZE - 9          # 单帧可用字节（含 HTTP 头）
-BLOCK_SIZE = 700                         # 头部约 300 字节，留余量
-
-_RESOURCES = {"conn": "conn", "realtime": "realtimeDisplay", "transport": "transport"}
-
+DELIM = 0x5A
 METHODS = ("GET", "POST", "DELETE", "STATE")
 
+PKT_MAGIC = 0x5C
+PKT_HEADER = 25                     # 图像报头长度（含 hidapi 的 report id）
+PKT_CHUNK = 1000                    # 每包携带的 JPEG 字节
+PKT_KIND_IMAGE = 0x21
+PKT_SEQ_START = 256                 # 每帧的起始包序号（厂商实测值）
 
-# ── 帧编码/解码（纯函数，可单测）─────────────────────────────────────────
+
+# ── 命令通道：编码 / 解码（纯函数，可单测）──────────────────────────────
 def stuff(data: bytes) -> bytes:
     out = bytearray()
     for b in data:
-        if b == 0x5A:
+        if b == DELIM:
             out += b"\x5b\x01"
         elif b == 0x5B:
             out += b"\x5b\x02"
@@ -67,7 +81,7 @@ def unstuff(data: bytes) -> bytes:
         b = data[i]
         if b == 0x5B and i + 1 < len(data):
             nxt = data[i + 1]
-            out.append(0x5A if nxt == 0x01 else 0x5B if nxt == 0x02 else nxt)
+            out.append(DELIM if nxt == 0x01 else 0x5B if nxt == 0x02 else nxt)
             i += 2
             continue
         out.append(b)
@@ -76,7 +90,7 @@ def unstuff(data: bytes) -> bytes:
 
 
 def build_frame(body: bytes) -> bytes:
-    """组一个 1024 字节报文载荷（不含 report id）。"""
+    """组一个 1024 字节报文（不含 hidapi 的 report id 前缀）。"""
     if len(body) > REPORT_SIZE - 9:
         raise InvalidArgument(f"body 太长：{len(body)} 字节，单帧上限 {REPORT_SIZE - 9}")
     raw = (len(body) + 5).to_bytes(2, "big") + body
@@ -100,53 +114,8 @@ def build_body(method: str, resource: str, headers: Mapping[str, Any] | None = N
     return bytes(head) + payload
 
 
-PACKET_HEADER = 21          # 报头里 LEN 之后的固定字段数（4..24 共 21 字节）
-CHUNK = 1000                # 每包最多携带的 JPEG 字节
-KIND_IMAGE = 0x21
-
-
-def image_packets(jpeg: bytes, seq: int = 256, chunk: int = CHUNK,
-                  kind: int = KIND_IMAGE) -> list[bytes]:
-    """把一张 JPEG 切成厂商格式的报文列表（每个 ≤1025 字节）。
-
-    实测报头（25 字节，含 hidapi 的 report id）::
-
-        00        report id
-        5C        magic
-        LEN(2, 大端) = 本包长度 - 4
-        kind      0x21 图片
-        00
-        N         整帧包数
-        00
-        seq(2, 小端) 逐包 +1
-        00 + 13 个 0
-
-    ``seq`` 是**帧内**序号：厂商每帧都从 256 重新开始、逐包 +1（实测 seq 回到 256
-    才说明新帧开始）。跨帧继续递增会被设备当成同一条流丢弃，只有第一帧能显示。
-    """
-    if not jpeg:
-        raise InvalidArgument("JPEG 为空")
-    chunks = [jpeg[i:i + chunk] for i in range(0, len(jpeg), chunk)]
-    total = len(chunks)
-    if total > 255:
-        raise InvalidArgument(f"单帧 {total} 包超出报头 blockCount 字段（≤255）")
-    out: list[bytes] = []
-    for index, piece in enumerate(chunks):
-        head = bytearray(25)
-        head[0] = 0x00                       # report id
-        head[1] = 0x5C                       # magic
-        head[2:4] = (PACKET_HEADER + len(piece)).to_bytes(2, "big")
-        head[4] = kind
-        head[5] = 0x00
-        head[6] = total
-        head[7] = 0x00
-        head[8:10] = ((seq + index) & 0xFFFF).to_bytes(2, "little")
-        out.append(bytes(head) + piece)
-    return out
-
-
 def parse_reply(raw: bytes) -> dict[str, Any] | None:
-    """从若干报文拼出的字节流里解一帧回复。"""
+    """从字节流里解一帧回复；不合法返回 None。"""
     if DELIM not in raw:
         return None
     start = raw.index(DELIM)
@@ -156,15 +125,14 @@ def parse_reply(raw: bytes) -> dict[str, Any] | None:
     body_bytes = unstuff(raw[start + 1:end])
     if len(body_bytes) < 3:
         return None
-    length = int.from_bytes(body_bytes[0:2], "big")
     body = body_bytes[2:-1]
-    if length != len(body) + 5:
+    if int.from_bytes(body_bytes[0:2], "big") != len(body) + 5:
         return None
     if sum(body_bytes[0:2] + body) & 0xFF != body_bytes[-1]:
         return None
 
     text = body.decode("utf-8", "replace")
-    line, _, rest = text.partition("\r\n")
+    line = text.partition("\r\n")[0]
     parts = line.split()
     status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
     headers: dict[str, str] = {}
@@ -172,11 +140,38 @@ def parse_reply(raw: bytes) -> dict[str, Any] | None:
     if "\r\n\r\n" in text:
         head, _, payload_text = text.partition("\r\n\r\n")
         for ln in head.split("\r\n")[1:]:
-            k, _, v = ln.partition("=")
-            if k:
-                headers[k] = v
+            key, _, value = ln.partition("=")
+            if key:
+                headers[key] = value
         payload = payload_text.encode()
     return {"status": status, "headers": headers, "payload": payload, "raw": body}
+
+
+# ── 图像通道：切包（纯函数，可单测）─────────────────────────────────────
+def image_packets(jpeg: bytes, seq: int = PKT_SEQ_START, chunk: int = PKT_CHUNK,
+                  kind: int = PKT_KIND_IMAGE) -> list[bytes]:
+    """把一张 JPEG 切成厂商格式的报文列表。
+
+    ``seq`` 是帧内序号：每帧都从 256 重新开始、逐包 +1（见模块 docstring）。
+    """
+    if not jpeg:
+        raise InvalidArgument("JPEG 为空")
+    chunks = [jpeg[i:i + chunk] for i in range(0, len(jpeg), chunk)]
+    total = len(chunks)
+    if total > 255:
+        raise InvalidArgument(f"单帧 {total} 包超出报头「包数」字段（≤255）")
+
+    packets: list[bytes] = []
+    for index, piece in enumerate(chunks):
+        head = bytearray(PKT_HEADER)
+        head[0] = 0x00                                    # report id（hidapi 要求）
+        head[1] = PKT_MAGIC
+        head[2:4] = (21 + len(piece)).to_bytes(2, "big")   # LEN = 包长 - 4
+        head[4] = kind
+        head[6] = total
+        head[8:10] = ((seq + index) & 0xFFFF).to_bytes(2, "little")
+        packets.append(bytes(head) + piece)
+    return packets
 
 
 class AigoXingcanlan(LcdComm):
@@ -188,14 +183,10 @@ class AigoXingcanlan(LcdComm):
         self._dev = None
         self._size = DEFAULT_SIZE
         self._spec: dict[str, Any] = {}
-        self._seq = 0
-        self._realtime = False
-        self._need_wake = True
+        self._cmd_seq = 0
         self._frames = 0
-        self._connected = False
-        self._missed_acks = 0
 
-    # ── 探测 ────────────────────────────────────────────────────────────
+    # ── 探测 / 打开 ─────────────────────────────────────────────────────
     @classmethod
     def probe(cls, config: Mapping[str, Any] | None = None) -> DeviceInfo | None:
         dev = cls._find_device()
@@ -204,27 +195,27 @@ class AigoXingcanlan(LcdComm):
         width, height = DEFAULT_SIZE
         return DeviceInfo(
             id=str(dev.get("serial_number") or "aigo-0113"),
-            name="爱国者 星璨岚 屏显版",
+            name=cls.display_name,
             width=width,
             height=height,
             shape="rect",
             native_rotation=0,
-            capabilities=Capability.PUSH_FULL,     # 推图通路待实测后再加别的
+            capabilities=Capability.PUSH_FULL,
             firmware="",
-            extra={"vendor_id": f"{dev['vendor_id']:04x}", "product_id": f"{dev['product_id']:04x}",
-                   "path": dev["path"].decode("utf-8", "replace") if isinstance(dev.get("path"), bytes)
-                   else str(dev.get("path")), "note": "分辨率来自公开参数，未由设备确认"},
+            extra={"path": cls._path_str(dev["path"]),
+                   "vendor_id": f"{dev['vendor_id']:04x}", "product_id": f"{dev['product_id']:04x}"},
         )
+
+    @staticmethod
+    def _path_str(path: Any) -> str:
+        return path.decode("utf-8", "replace") if isinstance(path, bytes) else str(path)
 
     @staticmethod
     def _find_device() -> dict[str, Any] | None:
         try:
             import hid
-        except Exception:
-            return None
-        try:
             devices = hid.enumerate()
-        except Exception:
+        except (ImportError, OSError):
             return None
         for dev in devices:
             if dev.get("product_id") != PID:
@@ -234,7 +225,6 @@ class AigoXingcanlan(LcdComm):
             return dev
         return None
 
-    # ── 打开 ────────────────────────────────────────────────────────────
     def open(self) -> DeviceInfo:
         info = self.probe(self.config)
         if info is None:
@@ -246,61 +236,36 @@ class AigoXingcanlan(LcdComm):
             self._dev.set_nonblocking(1)
         except Exception as exc:
             self.close()
-            raise DeviceBusy(f"HID 打不开（多半被 AIGO.exe 占着）: {exc}") from exc
+            raise DeviceBusy(f"HID 打不开（多半被官方软件占着）: {exc}") from exc
 
-        # 握手：POST conn（实测回 200 + 设备 JSON：version/space/brightness/degree/sn）
-        spec = self.request("POST", self.config.get("conn_resource") or "conn")
-        # 厂商的顺序：conn → STATE all heartbeat → power resume → realtimeDisplay enable。
-        # 少了 heartbeat / resume，设备会收下报文字节但**不换画面**（今天实测到的就是这个）。
-        self.heartbeat()
-        self.power_event("resume")
-        with contextlib.suppress(Exception):
-            self.start_realtime(True)
-            self._realtime = True
-        if spec and spec.get("payload"):
-            try:
-                self._connected = True
-            except Exception:
-                pass
-        if spec and spec.get("payload"):
-            try:
-                import json
-                data = json.loads(spec["payload"].decode("utf-8", "replace"))
-                self._spec = data if isinstance(data, dict) else {}
-                w = int(self._spec.get("width") or self._spec.get("w") or 0)
-                h = int(self._spec.get("height") or self._spec.get("h") or 0)
-                if w and h:
-                    self._size = (w, h)
-            except Exception:
-                self._spec = {}
-
-        # 唤醒只在打开时做一次：命令帧和图像流不能交错，否则设备会把流丢掉（实测整屏黑）
-        self._wake()
-        self._need_wake = False
+        reply = self.request("POST", "conn")
+        if reply and reply.get("payload"):
+            with contextlib.suppress(Exception):
+                self._spec = json.loads(reply["payload"].decode("utf-8", "replace"))
+        self._wake()                     # 之后不要再插命令帧，见 tick()
 
         return self.bind(DeviceInfo(
             id=info.id, name=info.name, width=self._size[0], height=self._size[1],
             shape="rect", native_rotation=int(self.config.get("rotation") or 0),
             capabilities=Capability.PUSH_FULL,
             firmware=str(self._spec.get("version") or ""),
-            extra={**dict(info.extra), "spec": self._spec or "未取到"},
+            extra={**info.extra, "spec": self._spec or "未取到"},
         ))
 
     def close(self) -> None:
         if self._dev is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self._dev.close()
-            except Exception:
-                pass
             self._dev = None
 
-    # ── 请求/回复 ───────────────────────────────────────────────────────
+    # ── 命令通道 ────────────────────────────────────────────────────────
     def request(self, method: str, resource: str, headers: Mapping[str, Any] | None = None,
                 payload: bytes = b"", timeout: float | None = None) -> dict[str, Any] | None:
+        """发一条命令，返回匹配 AckNumber 的回复；超时返回 None。"""
         if self._dev is None:
             raise DeviceOffline("设备还没 open")
-        self._seq += 1
-        hdrs = {"SeqNumber": self._seq, "ContentLength": len(payload) if payload else -1}
+        self._cmd_seq += 1
+        hdrs = {"SeqNumber": self._cmd_seq, "ContentLength": len(payload) if payload else -1}
         hdrs.update(dict(headers or {}))
         frame = build_frame(build_body(method, resource, hdrs, payload))
         try:
@@ -308,160 +273,102 @@ class AigoXingcanlan(LcdComm):
         except Exception as exc:
             raise DeviceOffline(f"HID 写入失败: {exc}") from exc
 
-        deadline = time.time() + (timeout if timeout is not None else float(self.config.get("timeout") or 1.5))
+        deadline = time.time() + (timeout if timeout is not None
+                                  else float(self.config.get("timeout") or 1.5))
         buf = bytearray()
         while time.time() < deadline:
             got = self._dev.read(REPORT_SIZE)
-            if got:
-                buf += bytes(got)
-                while buf.count(DELIM) >= 2:
-                    reply = parse_reply(bytes(buf))
-                    if not reply:
-                        break
-                    end = buf.index(DELIM, buf.index(DELIM) + 1) + 1
-                    buf = buf[end:]
-                    # 只认属于本次请求的回复：设备每个请求都回 AckNumber=SeqNumber+1。
-                    # 不校验就会读到上一个请求的回复——实测曾因此把 400 看成 200。
-                    ack = (reply.get("headers") or {}).get("AckNumber")
-                    if ack is not None:
-                        try:
-                            if int(ack) != self._seq + 1:
-                                continue
-                        except ValueError:
-                            pass
-                    return reply
-            else:
+            if not got:
                 time.sleep(0.01)
+                continue
+            buf += bytes(got)
+            while buf.count(DELIM) >= 2:
+                reply = parse_reply(bytes(buf))
+                if reply is None:
+                    buf.clear()
+                    break
+                buf = buf[buf.index(DELIM, buf.index(DELIM) + 1) + 1:]
+                ack = (reply.get("headers") or {}).get("AckNumber")
+                if ack is not None:
+                    try:
+                        if int(ack) != self._cmd_seq + 1:
+                            continue          # 上一条请求的残留回复
+                    except ValueError:
+                        pass
+                return reply
         return None
 
-    def _write(self, method: str, resource: str, headers: Mapping[str, Any] | None = None,
-               payload: bytes = b"") -> None:
-        """只写不等回包（数据块用，厂商软件同时开时回包会被抢）。"""
-        if self._dev is None:
-            raise DeviceOffline("设备还没 open")
-        self._seq += 1
-        hdrs = {"SeqNumber": self._seq, "Date": int(time.time() * 1000),
-                "ContentLength": len(payload) if payload else -1}
-        hdrs.update(dict(headers or {}))
-        try:
-            self._dev.write(b"\x00" + build_frame(build_body(method, resource, hdrs, payload)))
-        except Exception as exc:
-            raise DeviceOffline(f"HID 写入失败: {exc}") from exc
+    def _post_json(self, resource: str, obj: Mapping[str, Any],
+                   timeout: float = 1.5) -> dict[str, Any] | None:
+        body = json.dumps(obj).encode()
+        return self.request("POST", resource,
+                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=timeout)
 
-    # ── 送帧 ────────────────────────────────────────────────────────────
-    def set_mode(self, value: int) -> dict[str, Any] | None:
-        """切设备模式：payload 是 {"value": N}（不是 {"mode": N}，后者会被当成 0x7FFFFFFF）。
+    def set_brightness(self, percent: int) -> None:
+        percent = int(percent)
+        if not 0 <= percent <= 100:
+            raise InvalidArgument(f"亮度 {percent} 超出 0-100")
+        if not (self._post_json("brightness", {"value": percent}) or {}).get("status") == 200:
+            raise DeviceOffline("设置亮度没得到 200")
 
-        实测：0=默认 UI，2=可传输（推帧前设成 2）。
-        """
-        import json as _json
-        body = _json.dumps({"value": int(value)}).encode()
-        return self.request("POST", "mode",
-                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.5)
+    def set_mode(self, value: int) -> None:
+        """0=默认 UI、2=可传输。推帧必须 2，否则帧写得进但不显示。"""
+        if not (self._post_json("mode", {"value": int(value)}) or {}).get("status") == 200:
+            raise DeviceOffline("切换模式没得到 200")
 
-    def heartbeat(self) -> dict[str, Any] | None:
-        """STATE all + {"heartbeat":1}：设备靠它认为"对面还活着"。"""
-        import json as _json
-        body = _json.dumps({"heartbeat": 1}).encode()
-        return self.request("STATE", "all",
-                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.0)
+    def start_realtime(self, enable: bool = True) -> None:
+        if not (self._post_json("realtimeDisplay", {"enable": bool(enable)}) or {}).get("status") == 200:
+            raise DeviceOffline("切换实时显示没得到 200")
 
-    def power_event(self, event: str = "resume") -> dict[str, Any] | None:
-        """power resume/suspend：不 resume 的话，传输成功但画面不刷新。"""
-        import json as _json
-        body = _json.dumps({"event": event}).encode()
-        return self.request("POST", "power",
-                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.5)
-
-    def start_realtime(self, enable: bool = True) -> dict[str, Any] | None:
-        """进/出实时显示模式（实测：{"enable":true} → 200）。"""
-        body = b'{"enable":true}' if enable else b'{"enable":false}'
-        return self.request("POST", _RESOURCES["realtime"],
-                            {"ContentType": "json", "ContentLength": len(body)}, body)
-
+    # ── 图像通道 ────────────────────────────────────────────────────────
     def push_frame(self, frame: Frame) -> None:
-        """推一帧。
-
-        格式是抓包实测出来的：25 字节报头 + 最多 1000 字节 JPEG，
-        整帧切成若干 ≤1025 字节的 HID 报文连续写出，seq 跨帧递增。
-        """
-        import io
-
-        if (frame.width, frame.height) != self._size:
-            raise InvalidArgument(f"帧尺寸 {frame.size} 与设备 {self._size} 不一致")
         if self._dev is None:
             raise DeviceOffline("设备未打开")
+        if frame.size != self._size:
+            raise InvalidArgument(f"帧尺寸 {frame.size} 与设备 {self._size} 不一致")
 
         img = frame.to_image()
         rotation = int(self.config.get("rotation") or 0)
         if rotation % 360:
             img = img.rotate(-rotation % 360, expand=False)
 
-        quality = int(self.config.get("jpeg_quality") or 70)
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=False)
-        jpeg = buf.getvalue()
+        img.convert("RGB").save(buf, format="JPEG",
+                                quality=int(self.config.get("jpeg_quality") or 70), optimize=False)
+        packets = image_packets(buf.getvalue())
 
-        if self._need_wake:
-            self._wake()
-            self._need_wake = False
-
-        seq_start = int(self.config.get("seq_start") if self.config.get("seq_start") is not None else 256)
-        packets = image_packets(jpeg, seq_start)
-        gap = float(self.config.get("packet_gap") or 0.002)
+        gap = float(self.config.get("packet_gap", 0.002))
         for packet in packets:
             self._dev.write(packet)
             if gap > 0:
                 time.sleep(gap)
-        self._seq = seq_start + len(packets)
         self._frames += 1
-
-    def _wake(self) -> None:
-        """推流前把设备调到「能显示」的状态，每一步都确认真的回 200。
-
-        实测三件事缺一不可：
-        - 背光会被固件按 60 秒无流量调暗到 0（`brightness` 拉回 100）
-        - 必须处在 `mode 2`（可传输）；`mode 0` 时帧写得进去但屏上不显示
-        - `realtimeDisplay {"enable":true}` 打开实时通道
-        任何一步没确认成功就抛 DeviceBusy，让上层重开设备，而不是往黑屏里灌帧。
-        """
-        steps = (
-            ("brightness", lambda: self._brightness(int(self.config.get("brightness") or 100))),
-            ("mode", lambda: self.set_mode(int(
-                self.config.get("mode") if self.config.get("mode") is not None else 2))),
-            ("realtimeDisplay", lambda: self.start_realtime(True)),
-        )
-        for name, action in steps:
-            for attempt in range(3):
-                resp = None
-                with contextlib.suppress(Exception):
-                    resp = action()
-                if resp is not None and resp.get("status") == 200:
-                    break
-                time.sleep(0.3)
-            else:
-                raise DeviceBusy(f"唤醒失败：{name} 三次都没回 200，屏可能处于休眠/错误状态")
-        self._last_wake = time.time()
-
-    def _brightness(self, value: int) -> dict[str, Any] | None:
-        import json as _json
-        body = _json.dumps({"value": int(value)}).encode()
-        return self.request("POST", "brightness",
-                            {"ContentType": "json", "ContentLength": len(body)}, body, timeout=1.5)
 
     def push_region(self, frame: Frame, x: int, y: int) -> None:
         raise Unsupported("爱国者 星璨岚 目前只按整帧推")
 
-    def tick(self, now: float) -> None:
-        """不要在这里发命令帧。
+    def _wake(self) -> None:
+        """把设备调到「能显示」的状态：亮度 → mode 2 → 实时通道，每步都要 200。"""
+        steps = (
+            ("brightness", lambda: self.set_brightness(int(self.config.get("brightness") or 100))),
+            ("mode", lambda: self.set_mode(int(self.config.get("mode") if self.config.get("mode")
+                                              is not None else 2))),
+            ("realtimeDisplay", lambda: self.start_realtime(True)),
+        )
+        for name, action in steps:
+            for _ in range(3):
+                try:
+                    action()
+                    break
+                except (DeviceOffline, DeviceBusy, InvalidArgument, OSError):
+                    time.sleep(0.3)
+            else:
+                raise DeviceBusy(f"唤醒失败：{name} 三次都没成功，屏可能卡在休眠/错误状态")
 
-        这台固件把 HID 当成一条图像流：中途插进 `conn`/`brightness` 这类 5A 命令帧，
-        流的拼接就断了，屏会直接黑掉（实测）。唤醒只在 `open()` 里做一次，
-        之后再需要唤醒就等重新打开设备。
-        """
-        return
+    def tick(self, now: float) -> None:
+        """刻意留空：这台固件把 HID 当一条图像流，中途插入命令帧会让流断开、整屏黑。
+        需要唤醒时重新 open 设备即可（见 _wake）。"""
 
     def status(self) -> dict[str, Any]:
-        return {"driver": self.driver_id, "size": list(self._size), "seq": self._seq,
-                "frames": self._frames, "realtime": self._realtime, "missed_acks": self._missed_acks,
+        return {"driver": self.driver_id, "size": list(self._size), "frames": self._frames,
                 "open": self._dev is not None, "spec": self._spec or None}
