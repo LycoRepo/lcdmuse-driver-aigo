@@ -71,7 +71,11 @@ def test_push_frame_streams_realtime_then_blocks(monkeypatch):
         calls.append((method, resource, dict(headers or {}), len(payload)))
         return {"status": 200, "headers": {}, "payload": b""}
 
+    def fake_write(method, resource, headers=None, payload=b""):
+        calls.append((method, resource, dict(headers or {}), len(payload)))
+
     monkeypatch.setattr(drv, "request", fake_request)
+    monkeypatch.setattr(drv, "_write", fake_write)
     frame = Frame(width=16, height=8, data=bytes(16 * 8 * 3))
     drv.push_frame(frame)
 

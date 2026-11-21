@@ -18,6 +18,6 @@ settings_schema:
   png_colors:
     {type: int, default: 128, label: PNG 调色板色数, min: 0, max: 256, hint: 0=真彩；64~128 能把帧压到 8~15KB，快很多}
   chunk_timeout:
-    {type: float, default: 3.0, label: 单块超时（秒）}
+    {type: float, default: 1.0, label: 单块超时（秒）, hint: 厂商软件同时在跑时会抢回包，超时别设太大}
   timeout:
     {type: float, default: 1.5, label: 请求超时（秒）}

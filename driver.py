@@ -146,6 +146,7 @@ class AigoXingcanlan(LcdComm):
         self._realtime = False
         self._frames = 0
         self._connected = False
+        self._missed_acks = 0
 
     # ── 探测 ────────────────────────────────────────────────────────────
     @classmethod
@@ -255,13 +256,30 @@ class AigoXingcanlan(LcdComm):
             got = self._dev.read(REPORT_SIZE)
             if got:
                 buf += bytes(got)
-                if buf.count(DELIM) >= 2:
+                while buf.count(DELIM) >= 2:
                     reply = parse_reply(bytes(buf))
-                    if reply:
-                        return reply
+                    if not reply:
+                        break
+                    end = buf.index(DELIM, buf.index(DELIM) + 1) + 1
+                    buf = buf[end:]
+                    return reply
             else:
                 time.sleep(0.01)
         return None
+
+    def _write(self, method: str, resource: str, headers: Mapping[str, Any] | None = None,
+               payload: bytes = b"") -> None:
+        """只写不等回包（数据块用，厂商软件同时开时回包会被抢）。"""
+        if self._dev is None:
+            raise DeviceOffline("设备还没 open")
+        self._seq += 1
+        hdrs = {"SeqNumber": self._seq, "Date": int(time.time() * 1000),
+                "ContentLength": len(payload) if payload else -1}
+        hdrs.update(dict(headers or {}))
+        try:
+            self._dev.write(b"\x00" + build_frame(build_body(method, resource, hdrs, payload)))
+        except Exception as exc:
+            raise DeviceOffline(f"HID 写入失败: {exc}") from exc
 
     # ── 送帧 ────────────────────────────────────────────────────────────
     def start_realtime(self, enable: bool = True) -> dict[str, Any] | None:
@@ -297,13 +315,19 @@ class AigoXingcanlan(LcdComm):
 
         name = str(self.config.get("file_name") or "lcdmuse.png")
         total = (len(png) + BLOCK_SIZE - 1) // BLOCK_SIZE
-        chunk_timeout = float(self.config.get("chunk_timeout") or 3.0)
+        chunk_timeout = float(self.config.get("chunk_timeout") or 1.0)
 
-        start = self.request("POST", _RESOURCES["transport"],
-                             {"FileName": name, "FileSize": len(png), "ContentType": "image/png",
-                              "blockCount": total, "ContentLength": 0}, b"", timeout=chunk_timeout)
-        if start is None or start["status"] != 200:
-            raise DeviceOffline(f"传输起始被拒: {None if start is None else start['status']}")
+        start = None
+        for _ in range(3):
+            start = self.request("POST", _RESOURCES["transport"],
+                                 {"FileName": name, "FileSize": len(png), "ContentType": "image/png",
+                                  "blockCount": total, "ContentLength": 0}, b"", timeout=chunk_timeout)
+            if start is not None:
+                break
+        if start is not None and start["status"] != 200:
+            raise DeviceOffline(f"传输起始被拒: {start['status']}")
+        if start is None:
+            self._missed_acks += 1
 
         for index in range(total):
             piece = png[index * BLOCK_SIZE:(index + 1) * BLOCK_SIZE]
@@ -313,15 +337,14 @@ class AigoXingcanlan(LcdComm):
                        "ContentLength": len(piece)}
             if index == total - 1:
                 headers["isEnded"] = 1
-            reply = self.request("POST", _RESOURCES["transport"], headers, piece, timeout=chunk_timeout)
-            if reply is None or reply["status"] != 200:
-                raise DeviceOffline(f"第 {index}/{total} 块被拒: {None if reply is None else reply['status']}")
+            self._write("POST", _RESOURCES["transport"], headers, piece)
         self._frames += 1
+        self.request("POST", "conn", timeout=1.0)      # 发完对一次账，顺便把回包清干净
 
     def push_region(self, frame: Frame, x: int, y: int) -> None:
         raise Unsupported("爱国者 星璨岚 目前只按整帧推")
 
     def status(self) -> dict[str, Any]:
         return {"driver": self.driver_id, "size": list(self._size), "seq": self._seq,
-                "frames": self._frames, "realtime": self._realtime,
+                "frames": self._frames, "realtime": self._realtime, "missed_acks": self._missed_acks,
                 "open": self._dev is not None, "spec": self._spec or None}
