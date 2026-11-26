@@ -1,6 +1,6 @@
 # lcdmuse-driver-aigo — 爱国者「星璨岚」屏显版驱动
 
-给 [lcdmuse](https://github.com/LycoRepo/lcdmuse) 用的驱动插件：驱动**爱国者星璨岚屏显版**机箱副屏
+给 [lcdmuse](https://github.com/Phenix704/lcdmuse) 用的驱动插件：驱动**爱国者星璨岚屏显版**机箱副屏
 （USB HID 厂商自定义，1024 字节报文，面板 **1480×720**，设备自报 `degree=270`）。
 
 ```
